@@ -7,10 +7,10 @@ import torch.nn.functional as F
 
 from qwen_configs import Qwen35Config, make_small_config
 
-
 # ============================================================================
 # RMSNorm (note the non-standard, zero-init-centered variant used here)
 # ============================================================================
+
 
 class RMSNorm(nn.Module):
     """Qwen-style RMSNorm: zero-init weight, output = normalized * (1 + weight)."""
@@ -21,7 +21,12 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x):
-        raise NotImplementedError("TODO: implement RMSNorm.forward")
+
+        dtype = x.dtype
+        x = x.float()
+        normed = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        scaled = normed * (1 + self.weight)
+        return scaled.to(dtype)
 
 
 class RMSNormGated(nn.Module):
@@ -33,18 +38,28 @@ class RMSNormGated(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x, gate):
-        raise NotImplementedError("TODO: implement RMSNormGated.forward")
+
+        dtype = x.dtype
+        x = x.float()
+        normed = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        normed = normed.to(dtype)
+        scaled = normed * self.weight
+        gated = scaled * F.silu(gate.float())
+        return gated.to(dtype)
 
 
 # ============================================================================
 # Rotary position embedding (partial RoPE)
 # ============================================================================
 
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     # split x in half along the last dim: x1, x2
     # return cat(-x2, x1) along the last dim
-    raise NotImplementedError("TODO: implement rotate_half")
+
+    x1, x2 = torch.split(x, split_size_or_sections=x.shape[-1] // 2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
 
 
 class Qwen35RotaryEmbedding(nn.Module):
@@ -59,13 +74,26 @@ class Qwen35RotaryEmbedding(nn.Module):
         super().__init__()
         self.rotary_dim = int(config.head_dim * config.partial_rotary_factor)
         inv_freq = 1.0 / (
-            config.rope_theta ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim)
+            config.rope_theta
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32)
+                / self.rotary_dim
+            )
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     @torch.no_grad()
     def forward(self, hidden_states: torch.Tensor, position_ids: torch.LongTensor):
-        raise NotImplementedError("TODO: implement Qwen35RotaryEmbedding.forward")
+
+        dtype = hidden_states.dtype
+        device = hidden_states.device
+
+        freqs = position_ids.unsqueeze(-1) * self.inv_freq.view(1, 1, -1)
+        freqs = freqs.repeat(1, 1, 2)
+        sin = torch.sin(freqs).to(device=device, dtype=dtype)
+        cos = torch.cos(freqs).to(device=device, dtype=dtype)
+
+        return cos, sin
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):
@@ -73,13 +101,28 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     # only the first rotary_dim channels of q/k get rotated; the rest pass through unchanged
     # rotated = x * cos + rotate_half(x) * sin, applied to that leading slice, then re-concatenated
     # cos/sin need a head dim inserted to broadcast against q/k's (b, heads, s, dim) shape
-    raise NotImplementedError("TODO: implement apply_rotary_pos_emb")
+
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    rot_dim = cos.shape[-1]
+
+    q_slice = q[..., :rot_dim]
+    k_slice = k[..., :rot_dim]
+
+    rotate_q = q_slice * cos + rotate_half(q_slice) * sin
+    rotate_k = k_slice * cos + rotate_half(k_slice) * sin
+
+    rotate_q = torch.cat([rotate_q, q[..., rot_dim:]], dim=-1)
+    rotate_k = torch.cat([rotate_k, k[..., rot_dim:]], dim=-1)
+
+    return rotate_q, rotate_k
 
 
 # ============================================================================
 # Full attention: regular MHA + QK-norm + partial RoPE + output gate
 # GQA is an optional extension, discussed in week07_efficiency.
 # ============================================================================
+
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """Given helper for the GQA bonus; regular attention does not need it.
@@ -89,13 +132,17 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return hidden_states
     batch, num_kv_heads, seq_len, dim = hidden_states.shape
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, seq_len, dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_kv_heads, n_rep, seq_len, dim
+    )
     return hidden_states.reshape(batch, num_kv_heads * n_rep, seq_len, dim)
 
 
 def build_causal_mask(seq_len: int, dtype: torch.dtype, device) -> torch.Tensor:
     """Additive float causal mask of shape (1, 1, seq_len, seq_len)."""
-    mask = torch.full((seq_len, seq_len), torch.finfo(dtype).min, dtype=dtype, device=device)
+    mask = torch.full(
+        (seq_len, seq_len), torch.finfo(dtype).min, dtype=dtype, device=device
+    )
     mask = torch.triu(mask, diagonal=1)
     return mask[None, None, :, :]
 
@@ -117,20 +164,30 @@ class GatedAttention(nn.Module):
         self.head_dim = config.head_dim
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim ** -0.5
+        self.num_key_value_groups = (
+            config.num_attention_heads // config.num_key_value_heads
+        )
+        self.scaling = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim * 2, bias=config.attention_bias
+            config.hidden_size,
+            config.num_attention_heads * self.head_dim * 2,
+            bias=config.attention_bias,
         )
         self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
         )
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -146,21 +203,30 @@ class GatedAttention(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
 
         query_states, gate = torch.chunk(
-            self.q_proj(hidden_states).view(batch_size, seq_len, self.num_attention_heads, self.head_dim * 2),
-            2, dim=-1,
+            self.q_proj(hidden_states).view(
+                batch_size, seq_len, self.num_attention_heads, self.head_dim * 2
+            ),
+            2,
+            dim=-1,
         )
         gate = gate.reshape(batch_size, seq_len, -1)
 
         query_states = self.q_norm(query_states).transpose(1, 2)
         key_states = self.k_norm(
-            self.k_proj(hidden_states).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+            self.k_proj(hidden_states).view(
+                batch_size, seq_len, self.num_key_value_heads, self.head_dim
+            )
         ).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(
-            batch_size, seq_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
+        value_states = (
+            self.v_proj(hidden_states)
+            .view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+            .transpose(1, 2)
+        )
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin
+        )
         return query_states, key_states, value_states, gate
 
     def forward(self, hidden_states, position_embeddings, attention_mask=None):
@@ -175,9 +241,30 @@ class GatedAttention(nn.Module):
             return self.forward_gqa(hidden_states, position_embeddings, attention_mask)
 
         batch_size, seq_len, _ = hidden_states.shape
-        query_states, key_states, value_states, gate = self._project_qkv_and_gate(hidden_states, position_embeddings)
+        query_states, key_states, value_states, gate = self._project_qkv_and_gate(
+            hidden_states, position_embeddings
+        )
 
-        raise NotImplementedError("TODO: implement regular multi-head GatedAttention.forward")
+        attn_logits = query_states @ key_states.transpose(-1, -2)
+        attn_logits = attn_logits * self.scaling
+
+        if attention_mask is None:
+            attention_mask = build_causal_mask(
+                seq_len, attn_logits.dtype, attn_logits.device
+            )
+
+        attn_logits = attn_logits + attention_mask
+        attn_score = F.softmax(attn_logits, dim=-1, dtype=torch.float32).to(
+            hidden_states.dtype
+        )
+        attn = attn_score @ value_states
+
+        attn = attn.permute(0, 2, 1, 3)
+        attn = attn.reshape(batch_size, seq_len, -1)
+
+        gated_attn = attn * F.sigmoid(gate)
+        output = self.o_proj(gated_attn)
+        return output
 
     def forward_gqa(self, hidden_states, position_embeddings, attention_mask=None):
         """Bonus TODO: grouped-query attention for fewer KV heads than Q heads.
@@ -191,16 +278,48 @@ class GatedAttention(nn.Module):
         GQA and many more efficiency techniques will be explained in the
         week07_efficiency lecture.
         """
-        raise NotImplementedError("TODO (bonus): implement GatedAttention.forward_gqa")
+
+        batch_size, seq_len, _ = hidden_states.shape
+        query_states, key_states, value_states, gate = self._project_qkv_and_gate(
+            hidden_states, position_embeddings
+        )
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_logits = query_states @ key_states.transpose(-1, -2)
+        attn_logits = attn_logits * self.scaling
+
+        if attention_mask is None:
+            attention_mask = build_causal_mask(
+                seq_len, attn_logits.dtype, attn_logits.device
+            )
+
+        attn_logits = attn_logits + attention_mask
+        attn_score = F.softmax(attn_logits, dim=-1, dtype=torch.float32).to(
+            hidden_states.dtype
+        )
+        attn = attn_score @ value_states
+
+        attn = attn.permute(0, 2, 1, 3)
+        attn = attn.reshape(batch_size, seq_len, -1)
+
+        gated_attn = attn * F.sigmoid(gate)
+        output = self.o_proj(gated_attn)
+        return output
 
 
 @torch.no_grad()
-def naive_looped_gated_attention(attn: GatedAttention, hidden_states, position_embeddings, attention_mask=None):
+def naive_looped_gated_attention(
+    attn: GatedAttention, hidden_states, position_embeddings, attention_mask=None
+):
     """Given, fully-implemented reference: numerically identical to
     `GatedAttention.forward`, but with an explicit Python for-loop over heads.
     """
     batch_size, seq_len, _ = hidden_states.shape
-    query_states, key_states, value_states, gate = attn._project_qkv_and_gate(hidden_states, position_embeddings)
+    query_states, key_states, value_states, gate = attn._project_qkv_and_gate(
+        hidden_states, position_embeddings
+    )
 
     head_outputs = []
     for head_idx in range(attn.num_attention_heads):
@@ -230,21 +349,28 @@ def naive_looped_gated_attention(attn: GatedAttention, hidden_states, position_e
 # SwiGLU MLP
 # ============================================================================
 
+
 class MLP(nn.Module):
     def __init__(self, config: Qwen35Config, intermediate_size: int = None):
         super().__init__()
-        intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
+        intermediate_size = (
+            config.intermediate_size if intermediate_size is None else intermediate_size
+        )
         self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        raise NotImplementedError("TODO: implement MLP.forward")
+
+        gate = F.silu(self.gate_proj(x))
+        x = gate * self.up_proj(x)
+        return self.down_proj(x)
 
 
 # ============================================================================
 # Gated DeltaNet (linear attention)
 # ============================================================================
+
 
 def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """L2-normalize the last dimension of x. Given utility, not a blank."""
@@ -261,15 +387,31 @@ def gated_delta_rule_recurrent(query, key, value, g, beta):
     initial_dtype = query.dtype
     query = l2norm(query)
     key = l2norm(key)
-    query, key, value, beta, g = (x.transpose(1, 2).contiguous().float() for x in (query, key, value, beta, g))
+    query, key, value, beta, g = (
+        x.transpose(1, 2).contiguous().float() for x in (query, key, value, beta, g)
+    )
 
     batch_size, num_heads, seq_len, head_k_dim = key.shape
     head_v_dim = value.shape[-1]
-    scale = 1.0 / (head_k_dim ** 0.5)
+    scale = 1.0 / (head_k_dim**0.5)
     query = query * scale
 
-    state = torch.zeros(batch_size, num_heads, head_k_dim, head_v_dim, dtype=value.dtype, device=value.device)
-    core_attn_out = torch.zeros(batch_size, num_heads, seq_len, head_v_dim, dtype=value.dtype, device=value.device)
+    state = torch.zeros(
+        batch_size,
+        num_heads,
+        head_k_dim,
+        head_v_dim,
+        dtype=value.dtype,
+        device=value.device,
+    )
+    core_attn_out = torch.zeros(
+        batch_size,
+        num_heads,
+        seq_len,
+        head_v_dim,
+        dtype=value.dtype,
+        device=value.device,
+    )
 
     for t in range(seq_len):
         q_t, k_t, v_t = query[:, :, t], key[:, :, t], value[:, :, t]
@@ -306,17 +448,25 @@ class GatedDeltaNet(nn.Module):
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = nn.Conv1d(
-            in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False,
-            kernel_size=self.conv_kernel_size, groups=self.conv_dim, padding=self.conv_kernel_size - 1,
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            bias=False,
+            kernel_size=self.conv_kernel_size,
+            groups=self.conv_dim,
+            padding=self.conv_kernel_size - 1,
         )
 
-        self.in_proj_qkv = nn.Linear(config.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
+        self.in_proj_qkv = nn.Linear(
+            config.hidden_size, self.key_dim * 2 + self.value_dim, bias=False
+        )
         self.in_proj_z = nn.Linear(config.hidden_size, self.value_dim, bias=False)
         self.in_proj_b = nn.Linear(config.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(config.hidden_size, self.num_v_heads, bias=False)
 
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
-        self.A_log = nn.Parameter(torch.log(torch.empty(self.num_v_heads).uniform_(0, 16)))
+        self.A_log = nn.Parameter(
+            torch.log(torch.empty(self.num_v_heads).uniform_(0, 16))
+        )
 
         self.norm = RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
         self.out_proj = nn.Linear(self.value_dim, config.hidden_size, bias=False)
@@ -339,12 +489,45 @@ class GatedDeltaNet(nn.Module):
         See homework.ipynb for the equations and dtype requirements.
         """
         batch_size, seq_len, _ = hidden_states.shape
-        raise NotImplementedError("TODO: implement GatedDeltaNet.forward")
+
+        qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+        qkv = self.conv1d(qkv)[..., :seq_len]
+        qkv = F.silu(qkv).transpose(1, 2)
+
+        q, k, v = torch.split(
+            qkv,
+            split_size_or_sections=[self.key_dim, self.key_dim, self.value_dim],
+            dim=-1,
+        )
+        q = q.view(batch_size, seq_len, self.num_k_heads, -1)
+        k = k.view(batch_size, seq_len, self.num_k_heads, -1)
+        v = v.view(batch_size, seq_len, self.num_v_heads, -1)
+
+        repeat_factor = self.num_v_heads // self.num_k_heads
+        q = q.repeat_interleave(repeat_factor, dim=2)
+        k = k.repeat_interleave(repeat_factor, dim=2)
+
+        beta = F.sigmoid(self.in_proj_b(hidden_states))
+        gate = -torch.exp(self.A_log.float()) * F.softplus(
+            self.in_proj_a(hidden_states).float() + self.dt_bias.float()
+        )
+        gate = gate.to(hidden_states.dtype)
+
+        attn_output = gated_delta_rule_recurrent(q, k, v, gate, beta)
+        output_gate = self.in_proj_z(hidden_states).view(
+            batch_size, seq_len, self.num_v_heads, -1
+        )
+        output = self.norm(attn_output, output_gate)
+        output = output.view(batch_size, seq_len, -1)
+        output = self.out_proj(output)
+
+        return output
 
 
 # ============================================================================
 # Decoder layer, model, causal LM
 # ============================================================================
+
 
 class Qwen35DecoderLayer(nn.Module):
     """Pre-LN residual block; dispatches to full or linear attention.
@@ -362,11 +545,23 @@ class Qwen35DecoderLayer(nn.Module):
             self.linear_attn = GatedDeltaNet(config, layer_idx)
         self.mlp = MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(self, hidden_states, position_embeddings, attention_mask=None):
         """Applies the two pre-LN residual connections; see homework.ipynb for the formula."""
-        raise NotImplementedError("TODO: implement Qwen35DecoderLayer.forward")
+
+        if self.block_type == "full_attention":
+            residual = self.self_attn(
+                self.input_layernorm(hidden_states), position_embeddings, attention_mask
+            )
+        else:
+            residual = self.linear_attn(self.input_layernorm(hidden_states))
+
+        x = hidden_states + residual
+        x = x + self.mlp(self.post_attention_layernorm(x))
+        return x
 
 
 class Qwen35Model(nn.Module):
@@ -375,7 +570,10 @@ class Qwen35Model(nn.Module):
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            [Qwen35DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [
+                Qwen35DecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen35RotaryEmbedding(config)
@@ -385,7 +583,21 @@ class Qwen35Model(nn.Module):
         input_ids: (batch, seq_len) int64
         Returns last_hidden_state: (batch, seq_len, hidden_size)
         """
-        raise NotImplementedError("TODO: implement Qwen35Model.forward")
+
+        batch_size, seq_len = input_ids.shape
+
+        x = self.embed_tokens(input_ids)
+        position_ids = (
+            torch.arange(seq_len, device=input_ids.device)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
+        )
+        position_embeddings = self.rotary_emb(x, position_ids)
+        for layer in self.layers:
+            x = layer(x, position_embeddings)
+        x = self.norm(x)
+
+        return x
 
 
 class Qwen35ForCausalLM(nn.Module):
@@ -408,12 +620,22 @@ class Qwen35ForCausalLM(nn.Module):
         `embed_tokens.weight` when tied -- so this works unchanged for both
         tied and untied checkpoints.
         """
-        raise NotImplementedError("TODO: implement Qwen35ForCausalLM.forward")
+
+        last_hidden_state = self.model(input_ids)
+        logits = self.lm_head(last_hidden_state)
+
+        if labels is not None:
+            loss = F.cross_entropy(logits.transpose(1, 2), labels)
+        else:
+            loss = None
+
+        return logits, loss
 
 
 # ============================================================================
 # Scaling to other Qwen3.5 sizes
 # ============================================================================
+
 
 def qwen35_config_from_hf(config: dict) -> Qwen35Config:
     """Map a real Qwen3.5 dense model's config.json into a Qwen35Config.
@@ -429,7 +651,35 @@ def qwen35_config_from_hf(config: dict) -> Qwen35Config:
     # rope fields (rope_theta, partial_rotary_factor) live under a nested rope_scaling/rope_parameters dict
     # watch for tie_word_embeddings living at the top level, not under text_config
     # build and return Qwen35Config(**mapped_fields)
-    raise NotImplementedError("TODO: implement qwen35_config_from_hf")
+
+    text_config = config.get("text_config", config)
+
+    mapped_fields = {}
+    fields = dataclasses.fields(Qwen35Config)
+    field_names = {field.name: field for field in fields}
+
+    for name, field in field_names.items():
+        if name in text_config:
+            mapped_fields[name] = text_config.get(name, field.default)
+
+    mapped_fields["tie_word_embeddings"] = config.get(
+        "tie_word_embeddings",
+        text_config.get(
+            "tie_word_embeddings", field_names["tie_word_embeddings"].default
+        ),
+    )
+
+    rope_params = ["rope_theta", "partial_rotary_factor"]
+    for name in rope_params:
+        mapped_fields[name] = text_config["rope_parameters"].get(
+            name, field_names[name].default
+        )
+
+    mapped_fields["mtp_num_layers"] = text_config.get(
+        "mtp_num_hidden_layers", field_names["mtp_num_layers"].default
+    )
+
+    return Qwen35Config(**mapped_fields)
 
 
 # ============================================================================
@@ -439,6 +689,7 @@ def qwen35_config_from_hf(config: dict) -> Qwen35Config:
 # ----------------------------------------------------------------------------
 # Bonus: efficient chunked delta rule
 # ----------------------------------------------------------------------------
+
 
 def gated_delta_rule_chunked(query, key, value, g, beta, chunk_size: int = 64):
     """Bonus: chunked delta-rule recurrence -- same result as
@@ -451,12 +702,107 @@ def gated_delta_rule_chunked(query, key, value, g, beta, chunk_size: int = 64):
     # within a chunk, solve for the WY representation (a lower-triangular system) to get an
     # equivalent parallel/matmul form of the sequential delta-rule update
     # carry `state` across chunks exactly like the recurrent version carries it across timesteps
-    raise NotImplementedError("TODO (bonus): implement gated_delta_rule_chunked")
+
+    # Shapes: query/key/value (batch, seq_len, num_heads, dim); g, beta (batch, seq_len, num_heads).
+
+    initial_dtype = query.dtype
+    query = l2norm(query)
+    key = l2norm(key)
+    # [batch, seq_len, num_heads, ...] -> [batch, num_heads, seq_len, ...]
+    query, key, value, beta, g = (
+        x.transpose(1, 2).contiguous().float() for x in (query, key, value, beta, g)
+    )
+
+    batch_size, num_heads, seq_len, head_k_dim = key.shape
+    head_v_dim = value.shape[-1]
+    scale = 1.0 / (head_k_dim**0.5)
+    query = query * scale
+
+    state = torch.zeros(
+        batch_size,
+        num_heads,
+        head_k_dim,
+        head_v_dim,
+        dtype=value.dtype,
+        device=value.device,
+    )
+    core_attn_out = torch.zeros(
+        batch_size,
+        num_heads,
+        seq_len,
+        head_v_dim,
+        dtype=value.dtype,
+        device=value.device,
+    )
+
+    chunk_indices = torch.arange(0, seq_len, chunk_size)
+    n_chunks = chunk_indices.shape[0]
+    chunk_indices = torch.cat([chunk_indices, torch.tensor([seq_len])])
+
+    for n in range(n_chunks):
+        chunk_start, chunk_end = chunk_indices[n].item(), chunk_indices[n + 1].item()
+        chunk_seq_len = chunk_end - chunk_start
+        query_chunk, key_chunk, value_chunk, beta_chunk, g_chunk = (
+            x[:, :, chunk_start:chunk_end] for x in (query, key, value, beta, g)
+        )
+
+        decay_chunk = g_chunk.cumsum(-1).exp()
+        forward_decay_chunk = decay_chunk[..., -1:] / decay_chunk
+        Gamma_chunk = decay_chunk.unsqueeze(-1) @ (1 / decay_chunk.unsqueeze(-2))
+
+        ### [batch, num_heads, seq_len] -> [batch, num_heads, seq_len,  1]
+        decay_chunk = decay_chunk.unsqueeze(-1)
+        forward_decay_chunk = forward_decay_chunk.unsqueeze(-1)
+
+        G = key_chunk @ key_chunk.transpose(-1, -2)
+        eye = torch.eye(
+            chunk_seq_len,
+            device=G.device,
+            dtype=G.dtype,
+        )
+        ### COMPUTE U
+
+        ### same as tril(diag(beta) @ G, -1)
+        A = torch.tril(beta_chunk.unsqueeze(-1) * (Gamma_chunk * G), -1)
+
+        inv_U = eye + A
+        U = torch.linalg.solve_triangular(inv_U, eye.expand_as(inv_U), upper=False)
+
+        ### same as U @ diag(beta) @ V
+        U = (U * beta_chunk.unsqueeze(-2)) @ value_chunk
+
+        ### COMPUTE W
+        A = torch.tril(beta_chunk.unsqueeze(-1) * G, -1)
+        inv_W = eye + A
+        W = torch.linalg.solve_triangular(inv_W, eye.expand_as(inv_W), upper=False)
+        W = (W * beta_chunk.unsqueeze(-2)) @ key_chunk
+        ### we need only decayed W
+        W = W * decay_chunk
+
+        residual = U - W @ state
+
+        ### compute output
+        core_attn_out[:, :, chunk_start:chunk_end] += (
+            query_chunk * decay_chunk
+        ) @ state
+        intra_chunk_attn = Gamma_chunk * (query_chunk @ key_chunk.transpose(-1, -2))
+        core_attn_out[:, :, chunk_start:chunk_end] += (
+            torch.tril(intra_chunk_attn) @ residual
+        )
+
+        ### update state
+        state = (
+            state * decay_chunk[:, :, -1].unsqueeze(-1)
+            + (key_chunk * forward_decay_chunk).transpose(-1, -2) @ residual
+        )
+
+    return core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
 
 
 # ----------------------------------------------------------------------------
 # Bonus: Multi-Token Prediction (MTP) head
 # ----------------------------------------------------------------------------
+
 
 class Qwen35MTPHead(nn.Module):
     """Bonus: Multi-Token Prediction head. `__init__` is given below. See
@@ -467,11 +813,18 @@ class Qwen35MTPHead(nn.Module):
     def __init__(self, config: Qwen35Config):
         super().__init__()
         self.pre_fc_norm_hidden = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_fc_norm_embedding = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_embedding = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
-        full_attn_config = dataclasses.replace(config, layer_types=["full_attention"] * config.mtp_num_layers)
+        full_attn_config = dataclasses.replace(
+            config, layer_types=["full_attention"] * config.mtp_num_layers
+        )
         self.layers = nn.ModuleList(
-            [Qwen35DecoderLayer(full_attn_config, layer_idx) for layer_idx in range(config.mtp_num_layers)]
+            [
+                Qwen35DecoderLayer(full_attn_config, layer_idx)
+                for layer_idx in range(config.mtp_num_layers)
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen35RotaryEmbedding(config)
@@ -486,4 +839,26 @@ class Qwen35MTPHead(nn.Module):
         embedding classifier, including when the main LM head is untied.
         See homework.ipynb for the recipe.
         """
-        raise NotImplementedError("TODO (bonus): implement Qwen35MTPHead.forward")
+
+        batch_size, seq_len, hid_dim = hidden_states.shape
+
+        if seq_len < 3:
+            raise ValueError
+
+        position_ids = torch.arange(1, seq_len - 1, device=input_ids.device).expand(
+            batch_size, -1
+        )
+        pos_emb = self.rotary_emb(hidden_states[:, :-2], position_ids)
+
+        norm_hidden = self.pre_fc_norm_hidden(hidden_states[:, :-2])
+        norm_emb = self.pre_fc_norm_embedding(embed_tokens(input_ids[:, 1:-1]))
+
+        x = torch.cat([norm_hidden, norm_emb], dim=-1)
+        x = self.fc(x)
+
+        for layer in self.layers:
+            x = layer(x, pos_emb)
+
+        x = self.norm(x)
+        logits = x @ embed_tokens.weight.T
+        return logits
